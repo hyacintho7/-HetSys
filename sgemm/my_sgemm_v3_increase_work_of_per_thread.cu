@@ -62,8 +62,8 @@ __global__ void cuda_sgemm(float *A_ptr, float *B_ptr, float *C_ptr, const int M
     float *A_ptr_start = A_ptr + STEP * blockIdx.y * K;
     float *B_ptr_start = B_ptr + STEP * blockIdx.x;
 
-    __shared__ float a_shared[STEP][STEP];
-    __shared__ float b_shared[STEP][STEP];
+    __shared__ float a_shared[STEP][STEP + 1];
+    __shared__ float b_shared[STEP][STEP + 1];
     float temp[STRIDE][STRIDE] = {0.f};
 
     for (int s = 0; s < K; s += STEP)

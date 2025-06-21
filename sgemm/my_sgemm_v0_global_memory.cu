@@ -69,9 +69,9 @@ __global__ void cuda_sgemm(float *A_ptr, float *B_ptr, float *C_ptr, const int M
 
 int main()
 {
-    int m = 512;
-    int n = 512;
-    int k = 512;
+    int m = 1024;
+    int n = 1024;
+    int k = 1024;
     const size_t mem_size_A = m * k * sizeof(float);
     const size_t mem_size_B = m * k * sizeof(float);
     const size_t mem_size_C = m * k * sizeof(float);
