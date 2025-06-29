@@ -58,14 +58,19 @@
 # endif()
 
 cmake_minimum_required(VERSION 3.9)
-project(sgmm_test)
-enable_language(CUDA)
+project(sgmm_test LANGUAGES CXX CUDA)
+
 set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CUDA_STANDARD 11)
-find_package(CUDA REQUIRED)
+
+enable_language(CUDA)
+
+set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_ARCHITECTURES 89)  # 或更高，如 75, 80, 89
+
 
 set(INCLUDE_DIRS
     ${PROJECT_SOURCE_DIR}/include)
+include_directories(${INCLUDE_DIRS})
 
 set(CPP_SRC
     ${PROJECT_SOURCE_DIR}/src/main.cpp)
@@ -73,8 +78,18 @@ set(CPP_SRC
 set(CUDA_SRC
     ${PROJECT_SOURCE_DIR}/src/sgemm.cu)
 
-cuda_add_library(sgemm_core STATIC ${INCLUDE_DIRS} ${CUDA_SRC})
+# 使用现代方式创建 CUDA 静态库
+add_library(sgemm_core STATIC ${CUDA_SRC})
+target_include_directories(sgemm_core PUBLIC ${INCLUDE_DIRS})
+target_compile_options(sgemm_core PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>: --use_fast_math -lineinfo>
+)
 
-include_directories(${INCLUDE_DIRS})
+# 主程序
 add_executable(sgemm ${CPP_SRC})
-target_link_libraries(sgemm sgemm_core cublas)
+target_include_directories(sgemm PUBLIC ${INCLUDE_DIRS})
+target_compile_options(sgemm PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -O2>
+)
+# 链接
+target_link_libraries(sgemm PRIVATE sgemm_core cublas)

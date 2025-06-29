@@ -27,6 +27,10 @@ CostTime sgemm_gpu_v2(float *A, float *B, float *C, const int M, const int N,
 // 使用寄存器来优化
 CostTime sgemm_gpu_v3(float *A, float *B, float *C, const int M, const int N,
                       const int K);
+CostTime sgemm_gpu_v3_16_8(float *A, float *B, float *C, const int M, const int N,
+                           const int K);
+CostTime sgemm_gpu_v3_8_16(float *A, float *B, float *C, const int M, const int N,
+                           const int K);
 
 // 优化bank冲突——s_a列优先
 CostTime sgemm_gpu_v4(float *A, float *B, float *C, const int M, const int N,
@@ -39,10 +43,15 @@ CostTime sgemm_gpu_v5(float *A, float *B, float *C, const int M, const int N,
 // 指令并行化——预取
 CostTime sgemm_gpu_v6(float *A, float *B, float *C, const int M, const int N,
                       const int K);
+CostTime sgemm_gpu_wmma(float *A, float *B, float *C, const int M, const int N,
+                        const int K);
+CostTime sgemm_gpu_mma_ptx(float *A, float *B, float *C, const int M, const int N, const int K);
 
 // cublas  英伟达官方实现
 CostTime sgemm_cublas(float *A, float *B, float *C, const int M, const int N,
                       const int K);
+
+CostTime sgemm_cublas_tensorcore(float *A, float *B, float *C, const int M, const int N, const int K);
 
 using SgemmFunc = std::function<CostTime(float *, float *, float *, const int,
                                          const int, const int)>;

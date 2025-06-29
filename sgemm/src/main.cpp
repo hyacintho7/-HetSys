@@ -7,13 +7,19 @@
 int main(int argc, char **argv)
 {
     std::map<std::string, SgemmFunc> func_map = {
-        {"sgemm_gpu_v1", sgemm_gpu_v1},
-        {"sgemm_gpu_v2", sgemm_gpu_v2},
-        {"sgemm_gpu_v3", sgemm_gpu_v3},
-        {"sgemm_gpu_v4", sgemm_gpu_v4},
-        {"sgemm_gpu_v5", sgemm_gpu_v5},
+        // {"sgemm_gpu_v1", sgemm_gpu_v1},
+        // {"sgemm_gpu_v2", sgemm_gpu_v2},
+        // {"sgemm_gpu_v3 TM=8,TN=8", sgemm_gpu_v3},
+        // {"sgemm_gpu_v3 TM=16,TN=8", sgemm_gpu_v3_16_8},
+        // {"sgemm_gpu_v3 TM=8,TN=16", sgemm_gpu_v3_8_16},
+        {"sgemm_gpu_wmma", sgemm_gpu_wmma},
+        // {"sgemm_gpu_v4", sgemm_gpu_v4},
+        // {"sgemm_gpu_v5", sgemm_gpu_v5},
         {"sgemm_gpu_v6", sgemm_gpu_v6},
-        {"sgemm_cublas", sgemm_cublas},
+        // {"sgemm_cublas", sgemm_cublas},
+        {"sgemm_cublas_tensorcore", sgemm_cublas_tensorcore},
+        // {"sgemm_gpu_mma_ptx", sgemm_gpu_mma_ptx},
+
     };
 
     // test_error

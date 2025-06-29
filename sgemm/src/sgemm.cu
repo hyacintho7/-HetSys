@@ -10,6 +10,13 @@
 #include <cstdio>
 #include <cublas_v2.h>
 #include <random>
+#include <mma.h>
+#include <cuda_fp16.h>
+using namespace nvcuda;
+
+#define WMMA_M 16
+#define WMMA_N 16
+#define WMMA_K 16
 
 #define OFFSET(row, col, ld) ((row) * (ld) + (col))
 #define FETCH_FLOAT4(float_var) (reinterpret_cast<float4 *>(&(float_var))[0])
@@ -476,6 +483,482 @@ CostTime sgemm_gpu_v3(float *A, float *B, float *C, const int M, const int N,
     return cost_time;
 }
 
+__global__ void sgemm_gpu_kernel_v3_16_8(float *__restrict__ A,
+                                         float *__restrict__ B,
+                                         float *__restrict__ C,
+                                         const int M, const int N, const int K)
+{
+    const int TM = 16, TN = 8;
+    const int BM = 128, BN = 128;
+    const int BK = 8;
+
+    __shared__ float s_a[BM][BK]; // 128 x 8
+    __shared__ float s_b[BK][BN]; // 8 x 128
+
+    float r_a[TM];
+    float r_b[TN];
+    float r_c[TM][TN] = {0.0f};
+
+    const int thread_row = threadIdx.y * TM;
+    const int thread_col = threadIdx.x * TN;
+
+    const int global_row = blockIdx.y * BM + thread_row;
+    const int global_col = blockIdx.x * BN + thread_col;
+
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    for (int step = 0; step < K / BK; step++)
+    {
+        // 每个线程加载2个float4 → 2x4 = 8个float，总共128线程共加载1024 float
+        for (int load = 0; load < 2; load++)
+        {
+            int t = tid * 2 + load;
+
+            if (t < (BM * BK / 4)) // 128 * 8 / 4 = 256
+            {
+                int row = (t * 4) / BK;
+                int col = (t * 4) % BK;
+                int global_a_row = blockIdx.y * BM + row;
+                int global_a_col = step * BK + col;
+                int index_a = OFFSET(global_a_row, global_a_col, K);
+                FETCH_FLOAT4(s_a[row][col]) = FETCH_FLOAT4(A[index_a]);
+            }
+
+            if (t < (BN * BK / 4)) // 128 * 8 / 4 = 256
+            {
+                int row = (t * 4) / BN;
+                int col = (t * 4) % BN;
+                int global_b_row = step * BK + row;
+                int global_b_col = blockIdx.x * BN + col;
+                int index_b = OFFSET(global_b_row, global_b_col, N);
+                FETCH_FLOAT4(s_b[row][col]) = FETCH_FLOAT4(B[index_b]);
+            }
+        }
+
+        __syncthreads();
+
+        for (int k = 0; k < BK; ++k)
+        {
+            for (int i = 0; i < TM; ++i)
+                r_a[i] = s_a[thread_row + i][k];
+
+            for (int j = 0; j < TN; ++j)
+                r_b[j] = s_b[k][thread_col + j];
+
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j)
+                    r_c[i][j] += r_a[i] * r_b[j];
+        }
+
+        __syncthreads();
+    }
+
+    // 写回 C，每线程写回 r_c[16][8]
+    for (int i = 0; i < TM; ++i)
+    {
+        for (int j = 0; j < TN; j += 4)
+        {
+            int row = global_row + i;
+            int col = global_col + j;
+            int index_c = OFFSET(row, col, N);
+            FETCH_FLOAT4(C[index_c]) = FETCH_FLOAT4(r_c[i][j]);
+        }
+    }
+}
+
+CostTime sgemm_gpu_v3_16_8(float *A, float *B, float *C, const int M, const int N,
+                           const int K)
+{
+    CostTime cost_time;
+    TotalTimer total_timer;
+    total_timer.start();
+
+    const int TM = 16, TN = 8;    // 受线程最大寄存器数限制
+    const int BM = 128, BN = 128; // 受线程块最大线程数限制
+    // 理论上其大小不影响计算速度。为了每个线程刚好加载一个float4
+    const int BK = 8;
+
+    assert(M % BM == 0 && N % BN == 0 && K % BK == 0); // 核函数不处理边界情况
+    const dim3 block_size(BN / TN, BM / TM);
+    const dim3 grid_size((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    float *d_A, *d_B, *d_C;
+    const size_t size_A = M * K * sizeof(float);
+    const size_t size_B = K * N * sizeof(float);
+    const size_t size_C = M * N * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&d_A, size_A));
+    CUDA_CHECK(cudaMalloc(&d_B, size_B));
+    CUDA_CHECK(cudaMalloc(&d_C, size_C));
+
+    CUDA_CHECK(cudaMemcpy(d_A, A, size_A, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, B, size_B, cudaMemcpyHostToDevice));
+
+    KernelTimer kernel_timer;
+    kernel_timer.start();
+
+    sgemm_gpu_kernel_v3_16_8<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    kernel_timer.end();
+    cost_time.kernel = kernel_timer.cost();
+
+    CUDA_CHECK(cudaMemcpy(C, d_C, size_C, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+
+    total_timer.end();
+    cost_time.total = total_timer.cost();
+
+    return cost_time;
+}
+
+__global__ void sgemm_gpu_kernel_v3_8_16(float *__restrict__ A,
+                                         float *__restrict__ B,
+                                         float *__restrict__ C,
+                                         const int M, const int N, const int K)
+{
+    const int TM = 8, TN = 16;
+    const int BM = 128, BN = 128;
+    const int BK = 8;
+
+    __shared__ float s_a[BM][BK]; // 128 x 8
+    __shared__ float s_b[BK][BN]; // 8 x 128
+
+    float r_a[TM];
+    float r_b[TN];
+    float r_c[TM][TN] = {0.0f};
+
+    const int thread_row = threadIdx.y * TM;
+    const int thread_col = threadIdx.x * TN;
+
+    const int global_row = blockIdx.y * BM + thread_row;
+    const int global_col = blockIdx.x * BN + thread_col;
+
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+
+    for (int step = 0; step < K / BK; ++step)
+    {
+        // 每线程加载2个 float4，共 128*2 = 256 个 float4 = 1024 float
+        for (int load = 0; load < 2; ++load)
+        {
+            int t = tid * 2 + load;
+
+            // ---- 加载 A ----
+            if (t < (BM * BK / 4)) // 128×8 / 4 = 256 float4
+            {
+                int row = (t * 4) / BK;
+                int col = (t * 4) % BK;
+                int global_a_row = blockIdx.y * BM + row;
+                int global_a_col = step * BK + col;
+                int index_a = OFFSET(global_a_row, global_a_col, K);
+                FETCH_FLOAT4(s_a[row][col]) = FETCH_FLOAT4(A[index_a]);
+            }
+
+            // ---- 加载 B ----
+            if (t < (BK * BN / 4)) // 8×128 / 4 = 256 float4
+            {
+                int row = (t * 4) / BN;
+                int col = (t * 4) % BN;
+                int global_b_row = step * BK + row;
+                int global_b_col = blockIdx.x * BN + col;
+                int index_b = OFFSET(global_b_row, global_b_col, N);
+                FETCH_FLOAT4(s_b[row][col]) = FETCH_FLOAT4(B[index_b]);
+            }
+        }
+
+        __syncthreads();
+
+        for (int k = 0; k < BK; ++k)
+        {
+            for (int i = 0; i < TM; ++i)
+                r_a[i] = s_a[thread_row + i][k];
+
+            for (int j = 0; j < TN; ++j)
+                r_b[j] = s_b[k][thread_col + j];
+
+            for (int i = 0; i < TM; ++i)
+                for (int j = 0; j < TN; ++j)
+                    r_c[i][j] += r_a[i] * r_b[j];
+        }
+
+        __syncthreads();
+    }
+
+    // 写回 C
+    for (int i = 0; i < TM; ++i)
+    {
+        for (int j = 0; j < TN; j += 4)
+        {
+            int row = global_row + i;
+            int col = global_col + j;
+            int index_c = OFFSET(row, col, N);
+            FETCH_FLOAT4(C[index_c]) = FETCH_FLOAT4(r_c[i][j]);
+        }
+    }
+}
+
+CostTime sgemm_gpu_v3_8_16(float *A, float *B, float *C, const int M, const int N,
+                           const int K)
+{
+    CostTime cost_time;
+    TotalTimer total_timer;
+    total_timer.start();
+
+    const int TM = 8, TN = 16;    // 受线程最大寄存器数限制
+    const int BM = 128, BN = 128; // 受线程块最大线程数限制
+    // 理论上其大小不影响计算速度。为了每个线程刚好加载一个float4
+    const int BK = 8;
+
+    assert(M % BM == 0 && N % BN == 0 && K % BK == 0); // 核函数不处理边界情况
+    const dim3 block_size(BN / TN, BM / TM);
+    const dim3 grid_size((N + BN - 1) / BN, (M + BM - 1) / BM);
+
+    float *d_A, *d_B, *d_C;
+    const size_t size_A = M * K * sizeof(float);
+    const size_t size_B = K * N * sizeof(float);
+    const size_t size_C = M * N * sizeof(float);
+    CUDA_CHECK(cudaMalloc(&d_A, size_A));
+    CUDA_CHECK(cudaMalloc(&d_B, size_B));
+    CUDA_CHECK(cudaMalloc(&d_C, size_C));
+
+    CUDA_CHECK(cudaMemcpy(d_A, A, size_A, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B, B, size_B, cudaMemcpyHostToDevice));
+
+    KernelTimer kernel_timer;
+    kernel_timer.start();
+
+    sgemm_gpu_kernel_v3_8_16<<<grid_size, block_size>>>(d_A, d_B, d_C, M, N, K);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    kernel_timer.end();
+    cost_time.kernel = kernel_timer.cost();
+
+    CUDA_CHECK(cudaMemcpy(C, d_C, size_C, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_A));
+    CUDA_CHECK(cudaFree(d_B));
+    CUDA_CHECK(cudaFree(d_C));
+
+    total_timer.end();
+    cost_time.total = total_timer.cost();
+
+    return cost_time;
+}
+
+__global__ void sgemm_wmma_kernel(const __half *A, const __half *B, float *C, int M, int N, int K)
+{
+    // 确定 tile 坐标（以 WMMA_M/N 为粒度）
+    int tile_row = blockIdx.y;
+    int tile_col = blockIdx.x;
+
+    // 每个 warp 处理一个 tile
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+
+    // 支持多个 warp 每个 block（这里只分配一个 warp per block 处理一个 tile）
+    int global_row = tile_row * WMMA_M;
+    int global_col = tile_col * WMMA_N;
+
+    // 累加 fragment
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    // 处理所有 K tile
+    for (int tile_k = 0; tile_k < K; tile_k += WMMA_K)
+    {
+        // 定义 A/B 的 fragment
+        wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> a_frag;
+        wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __half, wmma::row_major> b_frag;
+
+        // 计算 global memory 中 A 和 B tile 的起始地址
+        const __half *tile_ptr_A = A + global_row * K + tile_k;
+        const __half *tile_ptr_B = B + tile_k * N + global_col;
+
+        // 从 global memory 加载 A/B tile 到 fragment
+        wmma::load_matrix_sync(a_frag, tile_ptr_A, K);
+        wmma::load_matrix_sync(b_frag, tile_ptr_B, N);
+
+        // 执行 FMA 操作
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    }
+
+    // 写回 C
+    float *out_ptr = C + global_row * N + global_col;
+    wmma::store_matrix_sync(out_ptr, c_frag, N, wmma::mem_row_major);
+}
+
+CostTime sgemm_gpu_wmma(float *A, float *B, float *C, const int M, const int N, const int K)
+{
+    CostTime cost_time;
+    TotalTimer total_timer;
+    total_timer.start();
+
+    // ========== 1. 检查维度合法性（必须为16的倍数） ==========
+    assert(M % 16 == 0 && N % 16 == 0 && K % 16 == 0);
+
+    // ========== 2. 分配 GPU 内存 ==========
+    __half *d_A_half, *d_B_half;
+    float *d_C;
+    size_t size_A_half = M * K * sizeof(__half);
+    size_t size_B_half = K * N * sizeof(__half);
+    size_t size_C = M * N * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&d_A_half, size_A_half));
+    CUDA_CHECK(cudaMalloc(&d_B_half, size_B_half));
+    CUDA_CHECK(cudaMalloc(&d_C, size_C));
+
+    // ========== 3. 主机侧 float 转 half ==========
+    std::vector<__half> h_A_half(M * K), h_B_half(K * N);
+    for (int i = 0; i < M * K; ++i)
+        h_A_half[i] = __float2half(A[i]);
+    for (int i = 0; i < K * N; ++i)
+        h_B_half[i] = __float2half(B[i]);
+
+    // ========== 4. 拷贝到 GPU ==========
+    CUDA_CHECK(cudaMemcpy(d_A_half, h_A_half.data(), size_A_half, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_half, h_B_half.data(), size_B_half, cudaMemcpyHostToDevice));
+
+    // ========== 5. 启动 kernel ==========
+    dim3 gridDim(N / 16, M / 16);
+    dim3 blockDim(32); // 一个 warp per block
+
+    KernelTimer kernel_timer;
+    kernel_timer.start();
+
+    sgemm_wmma_kernel<<<gridDim, blockDim>>>(d_A_half, d_B_half, d_C, M, N, K);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    kernel_timer.end();
+    cost_time.kernel = kernel_timer.cost();
+
+    // ========== 6. 拷回 C ==========
+    CUDA_CHECK(cudaMemcpy(C, d_C, size_C, cudaMemcpyDeviceToHost));
+
+    // ========== 7. 清理 ==========
+    CUDA_CHECK(cudaFree(d_A_half));
+    CUDA_CHECK(cudaFree(d_B_half));
+    CUDA_CHECK(cudaFree(d_C));
+
+    total_timer.end();
+    cost_time.total = total_timer.cost();
+
+    return cost_time;
+}
+
+#define WARP_SIZE 32
+#define TILE_M 8
+#define TILE_N 8
+#define TILE_K 4
+
+__global__ void mma_gemm_kernel(const __half *A, const __half *B, float *C, int M, int N, int K)
+{
+    int warp_id = (blockIdx.x + blockIdx.y * gridDim.x) * (blockDim.x / WARP_SIZE) + threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+
+    // warp tile coordinates
+    int tile_m = warp_id / (N / TILE_N);
+    int tile_n = warp_id % (N / TILE_N);
+
+    if (tile_m * TILE_M >= M || tile_n * TILE_N >= N)
+        return;
+
+    float c_frag[8] = {0.f}; // 8 element accumulator (8×8 tile, row-major flattened)
+
+    for (int tile_k = 0; tile_k < K; tile_k += TILE_K)
+    {
+        const __half *a_tile = A + tile_m * TILE_M * K + tile_k;
+        const __half *b_tile = B + tile_k * N + tile_n * TILE_N;
+
+        uint32_t a_frag[2], b_frag[2];
+        a_frag[0] = *(const uint32_t *)(a_tile);
+        a_frag[1] = *(const uint32_t *)(a_tile + 2);
+        b_frag[0] = *(const uint32_t *)(b_tile);
+        b_frag[1] = *(const uint32_t *)(b_tile + 2);
+
+        asm volatile(
+            "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
+            "{%0,%1,%2,%3,%4,%5,%6,%7}, "
+            "{%8,%9}, "
+            "{%10,%11}, "
+            "{%0,%1,%2,%3,%4,%5,%6,%7};\n"
+            : "+f"(c_frag[0]), "+f"(c_frag[1]), "+f"(c_frag[2]), "+f"(c_frag[3]),
+              "+f"(c_frag[4]), "+f"(c_frag[5]), "+f"(c_frag[6]), "+f"(c_frag[7])
+            : "r"(a_frag[0]), "r"(a_frag[1]),
+              "r"(b_frag[0]), "r"(b_frag[1]));
+    }
+
+    // write back to global memory
+    float *c_ptr = C + tile_m * TILE_M * N + tile_n * TILE_N;
+    for (int i = 0; i < 8; ++i)
+    {
+        c_ptr[i] = c_frag[i]; // 每行顺序写回（flattened）
+    }
+}
+
+CostTime sgemm_gpu_mma_ptx(float *A, float *B, float *C, const int M, const int N, const int K)
+{
+    assert(M % 8 == 0 && N % 8 == 0 && K % 4 == 0);
+
+    CostTime cost_time;
+    TotalTimer total_timer;
+    total_timer.start();
+
+    // ========== 1. 分配 Device 内存 ========== //
+    __half *d_A_half, *d_B_half;
+    float *d_C;
+    size_t size_A_half = M * K * sizeof(__half);
+    size_t size_B_half = K * N * sizeof(__half);
+    size_t size_C = M * N * sizeof(float);
+
+    cudaMalloc(&d_A_half, size_A_half);
+    cudaMalloc(&d_B_half, size_B_half);
+    cudaMalloc(&d_C, size_C);
+
+    // ========== 2. Host 侧 float -> half ========== //
+    std::vector<__half> h_A_half(M * K);
+    std::vector<__half> h_B_half(K * N);
+    for (int i = 0; i < M * K; ++i)
+        h_A_half[i] = __float2half(A[i]);
+    for (int i = 0; i < K * N; ++i)
+        h_B_half[i] = __float2half(B[i]);
+
+    // ========== 3. 拷贝到 Device ========== //
+    cudaMemcpy(d_A_half, h_A_half.data(), size_A_half, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B_half, h_B_half.data(), size_B_half, cudaMemcpyHostToDevice);
+
+    // ========== 4. 启动 Kernel ========== //
+    int num_warps = (M / TILE_M) * (N / TILE_N);
+    int threads_per_block = 32;
+    int blocks = (num_warps + threads_per_block - 1) / threads_per_block;
+    dim3 gridDim(blocks, 1);
+    // dim3 gridDim(N / 8, M / 8);
+    // dim3 blockDim(32); // 一个 warp per block
+
+    KernelTimer kernel_timer;
+    kernel_timer.start();
+    mma_gemm_kernel<<<gridDim, threads_per_block>>>(d_A_half, d_B_half, d_C, M, N, K);
+    cudaDeviceSynchronize();
+    kernel_timer.end();
+    cost_time.kernel = kernel_timer.cost();
+
+    // ========== 5. 结果拷回 Host ========== //
+    cudaMemcpy(C, d_C, size_C, cudaMemcpyDeviceToHost);
+
+    // ========== 6. 清理 ========== //
+    cudaFree(d_A_half);
+    cudaFree(d_B_half);
+    cudaFree(d_C);
+    total_timer.end();
+    cost_time.total = total_timer.cost();
+
+    return cost_time;
+}
+
 __global__ void sgemm_gpu_kernel_v4(float *__restrict__ A,
                                     float *__restrict__ B,
                                     float *__restrict__ C, const int M,
@@ -936,6 +1419,71 @@ CostTime sgemm_cublas(float *A, float *B, float *C, const int M, const int N,
     CUDA_CHECK(cudaFree(d_B));
     CUDA_CHECK(cudaFree(d_C));
 
+    CUBLAS_CHECK(cublasDestroy(handle));
+
+    total_timer.end();
+    cost_time.total = total_timer.cost();
+
+    return cost_time;
+}
+
+CostTime sgemm_cublas_tensorcore(float *A, float *B, float *C, const int M, const int N, const int K)
+{
+    CostTime cost_time;
+    TotalTimer total_timer;
+    total_timer.start();
+
+    cublasHandle_t handle;
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH));
+
+    // === Host to device, with half precision input ===
+    __half *d_A_half, *d_B_half;
+    float *d_C;
+    size_t size_A_half = M * K * sizeof(__half);
+    size_t size_B_half = K * N * sizeof(__half);
+    size_t size_C = M * N * sizeof(float);
+
+    CUDA_CHECK(cudaMalloc(&d_A_half, size_A_half));
+    CUDA_CHECK(cudaMalloc(&d_B_half, size_B_half));
+    CUDA_CHECK(cudaMalloc(&d_C, size_C));
+
+    // Convert input float arrays to half on host
+    std::vector<__half> h_A_half(M * K), h_B_half(K * N);
+    for (int i = 0; i < M * K; ++i)
+        h_A_half[i] = __float2half(A[i]);
+    for (int i = 0; i < K * N; ++i)
+        h_B_half[i] = __float2half(B[i]);
+
+    CUDA_CHECK(cudaMemcpy(d_A_half, h_A_half.data(), size_A_half, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_B_half, h_B_half.data(), size_B_half, cudaMemcpyHostToDevice));
+
+    float alpha = 1.0f;
+    float beta = 0.0f;
+
+    KernelTimer kernel_timer;
+    kernel_timer.start();
+
+    // === Tensor Core GEMM ===
+    CUBLAS_CHECK(cublasGemmEx(handle,
+                              CUBLAS_OP_N, CUBLAS_OP_N,
+                              N, M, K,
+                              &alpha,
+                              d_B_half, CUDA_R_16F, N,
+                              d_A_half, CUDA_R_16F, K,
+                              &beta,
+                              d_C, CUDA_R_32F, N,
+                              CUDA_R_32F,
+                              CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    kernel_timer.end();
+    cost_time.kernel = kernel_timer.cost();
+
+    CUDA_CHECK(cudaMemcpy(C, d_C, size_C, cudaMemcpyDeviceToHost));
+
+    CUDA_CHECK(cudaFree(d_A_half));
+    CUDA_CHECK(cudaFree(d_B_half));
+    CUDA_CHECK(cudaFree(d_C));
     CUBLAS_CHECK(cublasDestroy(handle));
 
     total_timer.end();
