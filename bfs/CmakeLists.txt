@@ -1,0 +1,47 @@
+cmake_minimum_required(VERSION 3.18)
+project(bfs LANGUAGES CXX CUDA)
+
+set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CUDA_STANDARD 14)
+set(CMAKE_CUDA_ARCHITECTURES 89)
+
+enable_language(CUDA)
+
+
+
+
+# 添加主可执行文件（包含所有 .cpp 文件）
+add_executable(bfs_exec
+    main.cpp
+    graph.cpp
+    bfsCPU.cpp
+)
+
+# 包含路径
+target_include_directories(bfs_exec PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+)
+
+# 找 libcuda 库（Driver API）
+find_library(CUDA_DRIVER_LIBRARY cuda PATHS /usr/lib /usr/local/cuda/lib64)
+target_link_libraries(bfs_exec PRIVATE ${CUDA_DRIVER_LIBRARY})
+
+# 编译 PTX 文件的规则（使用 nvcc 调用）
+set(PTX_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/bfsCUDA.ptx)
+add_custom_command(
+    OUTPUT ${PTX_OUTPUT}
+    COMMAND ${CMAKE_CUDA_COMPILER} ARGS
+        --ptx
+        -arch=sm_89
+        ${CMAKE_CURRENT_SOURCE_DIR}/bfsCUDA.cu
+        -o ${PTX_OUTPUT}
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/bfsCUDA.cu
+    COMMENT "Compiling PTX from bfsCUDA.cu"
+)
+
+# 创建一个 custom target 让它能构建
+add_custom_target(build_ptx ALL DEPENDS ${PTX_OUTPUT})
+
+# 确保可执行文件依赖于 PTX 构建
+add_dependencies(bfs_exec build_ptx)
