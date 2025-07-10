@@ -160,8 +160,8 @@ void runCudaSimpleBfs(int startVertex, Graph &G, std::vector<int> &distance,
         *changed = 0;
         void *args[] = {&G.numVertices, &level, &d_adjacencyList, &d_edgesOffset, &d_edgesSize, &d_distance, &d_parent,
                         &changed};
-        checkError(cuLaunchKernel(cuSimpleBfs, (G.numVertices + 255) / 256, 1, 1,
-                                  256, 1, 1, 0, 0, args, 0),
+        checkError(cuLaunchKernel(cuSimpleBfs, G.numVertices / 1024 + 1, 1, 1,
+                                  1024, 1, 1, 0, 0, args, 0),
                    "cannot run kernel simpleBfs");
         cuCtxSynchronize();
         level++;
@@ -193,8 +193,8 @@ void runCudaQueueBfs(int startVertex, Graph &G, std::vector<int> &distance,
     {
         void *args[] = {&level, &d_adjacencyList, &d_edgesOffset, &d_edgesSize, &d_distance, &d_parent, &queueSize,
                         &nextQueueSize, &d_currentQueue, &d_nextQueue};
-        checkError(cuLaunchKernel(cuQueueBfs, (queueSize + 255) / 256, 1, 1,
-                                  256, 1, 1, 0, 0, args, 0),
+        checkError(cuLaunchKernel(cuQueueBfs, queueSize / 1024 + 1, 1, 1,
+                                  1024, 1, 1, 0, 0, args, 0),
                    "cannot run kernel queueBfs");
         cuCtxSynchronize();
         level++;
@@ -214,8 +214,8 @@ void nextLayer(int level, int queueSize)
 {
     void *args[] = {&level, &d_adjacencyList, &d_edgesOffset, &d_edgesSize, &d_distance, &d_parent, &queueSize,
                     &d_currentQueue};
-    checkError(cuLaunchKernel(cuNextLayer, (queueSize + 255) / 256, 1, 1,
-                              256, 1, 1, 0, 0, args, 0),
+    checkError(cuLaunchKernel(cuNextLayer, queueSize / 1024 + 1, 1, 1,
+                              1024, 1, 1, 0, 0, args, 0),
                "cannot run kernel cuNextLayer");
     cuCtxSynchronize();
 }
@@ -224,8 +224,8 @@ void countDegrees(int level, int queueSize)
 {
     void *args[] = {&d_adjacencyList, &d_edgesOffset, &d_edgesSize, &d_parent, &queueSize,
                     &d_currentQueue, &d_degrees};
-    checkError(cuLaunchKernel(cuCountDegrees, (queueSize + 255) / 256, 1, 1,
-                              256, 1, 1, 0, 0, args, 0),
+    checkError(cuLaunchKernel(cuCountDegrees, queueSize / 1024 + 1, 1, 1,
+                              1024, 1, 1, 0, 0, args, 0),
                "cannot run kernel cuNextLayer");
     cuCtxSynchronize();
 }
@@ -234,17 +234,17 @@ void scanDegrees(int queueSize)
 {
     // run kernel so every block in d_currentQueue has prefix sums calculated
     void *args[] = {&queueSize, &d_degrees, &incrDegrees};
-    checkError(cuLaunchKernel(cuScanDegrees, (queueSize + 255) / 256, 1, 1,
-                              256, 1, 1, 0, 0, args, 0),
+    checkError(cuLaunchKernel(cuScanDegrees, queueSize / 1024 + 1, 1, 1,
+                              1024, 1, 1, 0, 0, args, 0),
                "cannot run kernel scanDegrees");
     cuCtxSynchronize();
 
     // count prefix sums on CPU for ends of blocks exclusive
     // already written previous block sum
     incrDegrees[0] = 0;
-    for (int i = 256; i < queueSize + 256; i += 256)
+    for (int i = 1024; i < queueSize + 1024; i += 1024)
     {
-        incrDegrees[i / 256] += incrDegrees[i / 256 - 1];
+        incrDegrees[i / 1024] += incrDegrees[i / 1024 - 1];
     }
 }
 
@@ -252,8 +252,8 @@ void assignVerticesNextQueue(int queueSize, int nextQueueSize)
 {
     void *args[] = {&d_adjacencyList, &d_edgesOffset, &d_edgesSize, &d_parent, &queueSize, &d_currentQueue,
                     &d_nextQueue, &d_degrees, &incrDegrees, &nextQueueSize};
-    checkError(cuLaunchKernel(cuAssignVerticesNextQueue, (queueSize + 255) / 256, 1, 1,
-                              256, 1, 1, 0, 0, args, 0),
+    checkError(cuLaunchKernel(cuAssignVerticesNextQueue, queueSize / 1024 + 1, 1, 1,
+                              1024, 1, 1, 0, 0, args, 0),
                "cannot run kernel assignVerticesNextQueue");
     cuCtxSynchronize();
 }
@@ -278,7 +278,7 @@ void runCudaScanBfs(int startVertex, Graph &G, std::vector<int> &distance,
         countDegrees(level, queueSize);
         // doing scan on degrees
         scanDegrees(queueSize);
-        nextQueueSize = incrDegrees[(queueSize - 1) / 256 + 1];
+        nextQueueSize = incrDegrees[(queueSize - 1) / 1024 + 1];
         // assigning vertices to nextQueue
         assignVerticesNextQueue(queueSize, nextQueueSize);
 
@@ -344,8 +344,8 @@ void runCudaGunrockBfs(int startVertex, Graph &G, std::vector<int> &distance,
             &level};
 
         checkError(cuLaunchKernel(cuGunrockStyleBfsKernel,
-                                  (G.numVertices + 255) / 256, 1, 1,
-                                  256, 1, 1, 0, 0, args, 0),
+                                  G.numVertices / 1024 + 1, 1, 1,
+                                  1024, 1, 1, 0, 0, args, 0),
                    "kernel launch failed"); //(G.numVertices + 255) / 256  G.numVertices / 1024 + 1
 
         checkError(cuCtxSynchronize(), "sync");

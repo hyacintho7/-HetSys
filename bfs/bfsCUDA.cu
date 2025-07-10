@@ -101,14 +101,14 @@ extern "C"
         if (thid < size)
         {
             // write initial values to shared memory
-            __shared__ int prefixSum[256];
+            __shared__ int prefixSum[1024];
             int modulo = threadIdx.x;
             prefixSum[modulo] = d_degrees[thid];
             __syncthreads();
 
             // calculate scan on this block
             // go up
-            for (int nodeSize = 2; nodeSize <= 256; nodeSize <<= 1)
+            for (int nodeSize = 2; nodeSize <= 1024; nodeSize <<= 1)
             {
                 if ((modulo & (nodeSize - 1)) == 0)
                 {
@@ -129,7 +129,7 @@ extern "C"
             }
 
             // go down
-            for (int nodeSize = 256; nodeSize > 1; nodeSize >>= 1)
+            for (int nodeSize = 1024; nodeSize > 1; nodeSize >>= 1)
             {
                 if ((modulo & (nodeSize - 1)) == 0)
                 {
