@@ -4,10 +4,17 @@ project(bfs LANGUAGES CXX CUDA)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CUDA_STANDARD 14)
 set(CMAKE_CUDA_ARCHITECTURES 89)
+SET(mgpu_INCLUDE_DIRS
+    /mnt/c/Users/wangh/Desktop/hpc/-HetSys/bfs/deps/moderngpu/src
+    CACHE PATH "mgpu include dir")
+if(mgpu_INCLUDE_DIRS)
+  include_directories(${mgpu_INCLUDE_DIRS})
+  set(CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS}; -I ${mgpu_INCLUDE_DIRS})
+else()
+  message(SEND_ERROR "ModernGPU not found")
+endif()
 
 enable_language(CUDA)
-
-
 
 
 # 添加主可执行文件（包含所有 .cpp 文件）
@@ -15,6 +22,7 @@ add_executable(bfs_exec
     main.cpp
     graph.cpp
     bfsCPU.cpp
+    bfs.cu
 )
 
 # 包含路径
@@ -24,8 +32,9 @@ target_include_directories(bfs_exec PRIVATE
 )
 
 # 找 libcuda 库（Driver API）
+include_directories(src)
 find_library(CUDA_DRIVER_LIBRARY cuda PATHS /usr/lib /usr/local/cuda/lib64)
-target_link_libraries(bfs_exec PRIVATE ${CUDA_DRIVER_LIBRARY})
+target_link_libraries(bfs_exec PRIVATE ${CUDA_DRIVER_LIBRARY} gswitch)
 
 # 编译 PTX 文件的规则（使用 nvcc 调用）
 set(PTX_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/bfsCUDA.ptx)
@@ -45,3 +54,24 @@ add_custom_target(build_ptx ALL DEPENDS ${PTX_OUTPUT})
 
 # 确保可执行文件依赖于 PTX 构建
 add_dependencies(bfs_exec build_ptx)
+target_compile_options(bfs_exec PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+)
+
+# message(STATUS "CMAKE_SOURCE_DIR:!!! ${CMAKE_SOURCE_DIR}")
+# message(STATUS "mgpu_INCLUDE_DIRS:!!! ${mgpu_INCLUDE_DIRS}")
+
+
+# add_executable(BFS
+#     bfs.cu
+# )
+
+# target_include_directories(BFS PRIVATE
+#     ${CMAKE_CURRENT_SOURCE_DIR}
+#     ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES}
+#     ${mgpu_INCLUDE_DIRS}
+# )
+
+# target_link_libraries(BFS PRIVATE gswitch)
+
+# target_compile_options(BFS PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>)

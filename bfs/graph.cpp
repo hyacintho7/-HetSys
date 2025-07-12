@@ -105,7 +105,7 @@ void readGraph(Graph &G, int argc, char **argv)
             continue;
 
         adjacencyLists[u].push_back(v);
-        // adjacencyLists[v].push_back(u); // 假设无向图（可根据需要去掉）
+        adjacencyLists[v].push_back(u); // 假设无向图（可根据需要去掉）
     }
 
     // 构建 CSR 格式

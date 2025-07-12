@@ -205,7 +205,7 @@ extern "C"
         for (int i = 0; i < degree; ++i)
         {
             int v = adjacencyList[start + i];
-            if (atomicCAS(&distance[v], -1, level + 1) == -1)
+            if (atomicCAS(&distance[v], INT_MAX, level + 1) == INT_MAX)
             {
                 parent[v] = u;
 
