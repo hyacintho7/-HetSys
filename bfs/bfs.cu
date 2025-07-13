@@ -115,7 +115,7 @@ double run_bfs(G g, F f, int root)
   return e - s;
 }
 
-int runGswitchbfs(int argc, char *argv[])
+float runGswitchbfs(int argc, char *argv[])
 {
   parse_cmd(argc, argv, "BFS");
 
@@ -157,7 +157,7 @@ int runGswitchbfs(int argc, char *argv[])
   }
 
   LOG("GPU BFS time: %.3f ms\n", time);
-  std::cout << "Kernel execution time:" << time * 1000 << " us" << std::endl;
+  std::cout << "Kernel execution time:" << time << " ms" << std::endl;
   // std::cout << fets.nvertexs << " "
   //<< fets.nedges << " "
   //<< fets.avg_deg << " "
@@ -166,5 +166,5 @@ int runGswitchbfs(int argc, char *argv[])
   //<< fets.GI << " "
   //<< fets.Her << " "
   //<< time << std::endl;
-  return 0;
+  return time * 1.0f;
 }

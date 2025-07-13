@@ -3,6 +3,9 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <fstream>
+#include <filesystem>
+#include <regex>
 #include "graph.h"
 #include "bfsCPU.h"
 #include <cuda.h> // CUDA Driver API
@@ -11,7 +14,7 @@
 // #include <gunrock/graphio/graphio.cuh>
 // #include <gunrock/app/bfs/bfs_app.cuh>
 
-int runGswitchbfs(int argc, char **argv);
+float runGswitchbfs(int argc, char **argv);
 
 void runCpu(int startVertex, Graph &G, std::vector<int> &distance,
             std::vector<int> &parent, std::vector<bool> &visited)
@@ -145,7 +148,7 @@ void finalizeCudaBfs(std::vector<int> &distance, std::vector<int> &parent, Graph
 }
 
 void runCudaSimpleBfs(int startVertex, Graph &G, std::vector<int> &distance,
-                      std::vector<int> &parent)
+                      std::vector<int> &parent, float &kernelTimeUs)
 {
     initializeCudaBfs(startVertex, distance, parent, G);
 
@@ -179,7 +182,8 @@ void runCudaSimpleBfs(int startVertex, Graph &G, std::vector<int> &distance,
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    // printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    kernelTimeUs = ms;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -188,7 +192,7 @@ void runCudaSimpleBfs(int startVertex, Graph &G, std::vector<int> &distance,
 }
 
 void runCudaQueueBfs(int startVertex, Graph &G, std::vector<int> &distance,
-                     std::vector<int> &parent)
+                     std::vector<int> &parent, float &kernelTimeUs)
 {
     initializeCudaBfs(startVertex, distance, parent, G);
 
@@ -224,7 +228,8 @@ void runCudaQueueBfs(int startVertex, Graph &G, std::vector<int> &distance,
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    // printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    kernelTimeUs = ms;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -281,7 +286,7 @@ void assignVerticesNextQueue(int queueSize, int nextQueueSize)
 }
 
 void runCudaScanBfs(int startVertex, Graph &G, std::vector<int> &distance,
-                    std::vector<int> &parent)
+                    std::vector<int> &parent, float &kernelTimeUs)
 {
     initializeCudaBfs(startVertex, distance, parent, G);
 
@@ -317,7 +322,8 @@ void runCudaScanBfs(int startVertex, Graph &G, std::vector<int> &distance,
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    // printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    kernelTimeUs = ms;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -338,7 +344,7 @@ void runCudaScanBfs(int startVertex, Graph &G, std::vector<int> &distance,
 // }
 
 void runCudaGunrockBfs(int startVertex, Graph &G, std::vector<int> &distance,
-                       std::vector<int> &parent)
+                       std::vector<int> &parent, float &kernelTimeUs)
 {
     initializeCudaBfs(startVertex, distance, parent, G);
 
@@ -402,7 +408,8 @@ void runCudaGunrockBfs(int startVertex, Graph &G, std::vector<int> &distance,
 
     float ms = 0.0f;
     cudaEventElapsedTime(&ms, start, stop);
-    printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    // printf("Kernel execution time: %.3f us\n", ms * 1000.0f);
+    kernelTimeUs = ms;
 
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
@@ -418,86 +425,102 @@ void runCudaGunrockBfs(int startVertex, Graph &G, std::vector<int> &distance,
 
 int main(int argc, char **argv)
 {
+    std::string datasetName = "unknown";
+    for (int i = 1; i < argc; ++i)
+    {
+        std::string arg = argv[i];
+        if (arg.size() >= 4 && arg.substr(arg.size() - 4) == ".mtx")
+        {
+            // 提取最后一个 '/' 后的文件名
+            size_t lastSlash = arg.find_last_of("/\\");
+            std::string filename = (lastSlash == std::string::npos) ? arg : arg.substr(lastSlash + 1);
+            size_t dotPos = filename.find_last_of(".");
+            if (dotPos != std::string::npos)
+            {
+                datasetName = filename.substr(0, dotPos); // 去掉 .mtx
+            }
+            else
+            {
+                datasetName = filename;
+            }
+            break;
+        }
+    }
+    std::string csvFilename = "bfs_" + datasetName + ".csv";
+    std::ofstream csvFile(csvFilename);
+    csvFile << "Algorithm,KernelTime(ms),EndToEndTime(ms)\n";
 
-    // read graph from standard input
-    auto start_total_load = std::chrono::high_resolution_clock::now();
     Graph G;
     int startVertex = atoi(argv[1]);
+    auto start_total_load = std::chrono::high_resolution_clock::now();
     readGraph(G, argc, argv);
+    auto end_total_load = std::chrono::high_resolution_clock::now();
+    double total_time_ms_load = std::chrono::duration<double, std::milli>(end_total_load - start_total_load).count();
 
-    printf("Number of vertices %d\n", G.numVertices);
-    printf("Number of edges %d\n\n", G.numEdges);
-
-    // vectors for results
     std::vector<int> distance(G.numVertices, std::numeric_limits<int>::max());
     std::vector<int> parent(G.numVertices, std::numeric_limits<int>::max());
     std::vector<bool> visited(G.numVertices, false);
-    auto end_total_load = std::chrono::high_resolution_clock::now();
-    double total_time_ms_load = std::chrono::duration<double, std::milli>(end_total_load - start_total_load).count();
-    std::cout << "Preliminary loading time: " << total_time_ms_load << " ms" << std::endl
-              << std::endl;
 
-    // run CPU sequential bfs
     runCpu(startVertex, G, distance, parent, visited);
-
-    // save results from sequential bfs
     std::vector<int> expectedDistance(distance);
     std::vector<int> expectedParent(parent);
 
     initCuda(G);
-    // run CUDA simple parallel bfs
 
-    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    float kernel_time = 0.0f;
     auto start_total = std::chrono::high_resolution_clock::now();
-    runCudaSimpleBfs(startVertex, G, distance, parent);
+    runCudaSimpleBfs(startVertex, G, distance, parent, kernel_time);
     checkOutput(distance, expectedDistance, G);
     auto end_total = std::chrono::high_resolution_clock::now();
     double total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    std::cout << "End-to-end time: " << total_time_ms + total_time_ms_load << " ms" << std::endl
-              << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::cout << "SimpleBFS Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "SimpleBFS End-to-end time: " << total_time_ms + total_time_ms_load << " ms\n\n";
+    csvFile << "SimpleBFS," << kernel_time << "," << total_time_ms + total_time_ms_load << "\n";
 
-    // run CUDA queue parallel bfs
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
     start_total = std::chrono::high_resolution_clock::now();
-    runCudaQueueBfs(startVertex, G, distance, parent);
+    runCudaQueueBfs(startVertex, G, distance, parent, kernel_time);
     checkOutput(distance, expectedDistance, G);
     end_total = std::chrono::high_resolution_clock::now();
     total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    std::cout << "End-to-end time: " << total_time_ms + total_time_ms_load << " ms" << std::endl
-              << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::cout << "QueueBFS Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "QueueBFS End-to-end time: " << total_time_ms + total_time_ms_load << " ms\n\n";
+    csvFile << "QueueBFS," << kernel_time << "," << total_time_ms + total_time_ms_load << "\n";
 
-    // run CUDA scan parallel bfs
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
     start_total = std::chrono::high_resolution_clock::now();
-    runCudaScanBfs(startVertex, G, distance, parent);
+    runCudaScanBfs(startVertex, G, distance, parent, kernel_time);
     checkOutput(distance, expectedDistance, G);
     end_total = std::chrono::high_resolution_clock::now();
     total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    std::cout << "End-to-end time: " << total_time_ms + total_time_ms_load << " ms" << std::endl
-              << std::endl;
+    std::cout << "ScanBFS Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "ScanBFS End-to-end time: " << total_time_ms + total_time_ms_load << " ms\n\n";
+    csvFile << "ScanBFS," << kernel_time << "," << total_time_ms + total_time_ms_load << "\n";
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // runGunrockBFS(startVertex, G, distance);
+    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // kernel_time = 0.0f;
+    // start_total = std::chrono::high_resolution_clock::now();
+    // runCudaGunrockBfs(startVertex, G, distance, parent, kernel_time);
     // checkOutput(distance, expectedDistance, G);
-    start_total = std::chrono::high_resolution_clock::now();
-    runCudaGunrockBfs(startVertex, G, distance, parent);
-    checkOutput(distance, expectedDistance, G);
-    end_total = std::chrono::high_resolution_clock::now();
-    total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-
-    std::cout << "End-to-end time: " << total_time_ms + total_time_ms_load << " ms" << std::endl
-              << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // end_total = std::chrono::high_resolution_clock::now();
+    // total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    // std::cout << "GunrockBFS Kernel execution time: " << kernel_time << " ms\n";
+    // std::cout << "GunrockBFS End-to-end time: " << total_time_ms + total_time_ms_load << " ms\n\n";
+    // csvFile << "GunrockBFS," << kernel_time << "," << total_time_ms + total_time_ms_load << "\n";
 
     finalizeCuda();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
     std::cout << "Starting Gswitch bfs." << std::endl;
     start_total = std::chrono::high_resolution_clock::now();
-    runGswitchbfs(argc, argv);
-    printf("Output OK!\n");
+    kernel_time = runGswitchbfs(argc, argv);
     end_total = std::chrono::high_resolution_clock::now();
     total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    std::cout << "End-to-end time: " << total_time_ms << " ms" << std::endl;
+    std::cout << "GswitchBFS End-to-end time: " << total_time_ms << " ms\n";
+    csvFile << "GswitchBFS," << kernel_time << "," << total_time_ms << "\n";
 
+    csvFile.close();
     return 0;
 }
