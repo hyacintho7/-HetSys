@@ -4,16 +4,25 @@ import seaborn as sns
 import os
 
 # 读取所有 bfs_*.csv 文件
-csv_dir = "."  # 当前目录
+csv_dir = "../build/bfs"  # 上级的 build/bfs 目录
 csv_files = [f for f in os.listdir(csv_dir) if f.startswith("bfs_") and f.endswith(".csv")]
 
 # 合并所有文件并标记数据集名
 all_data = []
 for file in csv_files:
-    df = pd.read_csv(os.path.join(csv_dir, file))
-    dataset = file.replace("bfs_", "").replace(".csv", "")
-    df["Dataset"] = dataset
-    all_data.append(df)
+    path = os.path.join(csv_dir, file)
+    try:
+        df = pd.read_csv(path)
+        if df.empty or df.shape[1] == 0:
+            print(f"Skipping empty or invalid file: {file}")
+            continue
+        dataset = file.replace("bfs_", "").replace(".csv", "")
+        df["Dataset"] = dataset
+        all_data.append(df)
+    except pd.errors.EmptyDataError:
+        print(f"Skipping empty file: {file}")
+    except Exception as e:
+        print(f"Failed to read {file}: {e}")
 
 df = pd.concat(all_data, ignore_index=True)
 

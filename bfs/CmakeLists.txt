@@ -23,6 +23,7 @@ add_executable(bfs_exec
     graph.cpp
     bfsCPU.cpp
     bfs.cu
+    scanbfs.cu
 )
 
 # 包含路径
