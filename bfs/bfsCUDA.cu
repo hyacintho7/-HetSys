@@ -1,5 +1,6 @@
 #include <device_launch_parameters.h>
 #include <cstdio>
+#include <cub/cub.cuh>
 
 extern "C"
 {
@@ -320,6 +321,180 @@ extern "C"
             {
                 int pos = writePos + i;
                 nextQueue[pos] = localNeighbors[i];
+            }
+        }
+    }
+    __global__ void scanBfsFusedKernel_WM(
+        const int *__restrict__ currentQueue,
+        int queueSize,
+        const int *__restrict__ adjacencyList,
+        const int *__restrict__ edgesOffset,
+        const int *__restrict__ edgesSize,
+        int *distance,
+        int *parent,
+        int *nextQueue,
+        int *nextQueueSize,
+        int level)
+    {
+        int tid = blockIdx.x * blockDim.x + threadIdx.x;
+        int laneId = threadIdx.x % 32;
+        int warpId = threadIdx.x / 32;
+        int warpGlobalId = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
+        const int warpSize = 32;
+        const int maxWarpsPerBlock = blockDim.x / warpSize;
+
+        extern __shared__ int shared[];
+        int *vList = shared; // [maxWarps][32]
+        int *vStartOffsets = vList + maxWarpsPerBlock * warpSize;
+        int *vDegrees = vStartOffsets + maxWarpsPerBlock * warpSize;
+        int *prefixDegrees = vDegrees + maxWarpsPerBlock * warpSize;
+        int *threadCounts = prefixDegrees + maxWarpsPerBlock * warpSize;
+        int *threadOffsets = threadCounts + blockDim.x;
+        int *sharedOffset = threadOffsets + blockDim.x;
+        int *sharedGlobalOffset = sharedOffset + warpSize;
+
+        // Step 1: Load vertex info
+        if (laneId < warpSize)
+        {
+            int vidx = warpGlobalId * warpSize + laneId;
+            int v = (vidx < queueSize) ? currentQueue[vidx] : -1;
+
+            int deg = 0;
+            int start = 0;
+            if (v != -1)
+            {
+                start = edgesOffset[v];
+                deg = edgesSize[v];
+            }
+
+            vList[warpId * 32 + laneId] = v;
+            vStartOffsets[warpId * 32 + laneId] = start;
+            vDegrees[warpId * 32 + laneId] = deg;
+        }
+        __syncthreads();
+
+        // Step 2: warp-level prefix sum on degrees
+        int deg = vDegrees[warpId * 32 + laneId];
+        int prefix = deg;
+        for (int offset = 1; offset < 32; offset <<= 1)
+        {
+            int n = __shfl_up_sync(0xffffffff, prefix, offset);
+            if (laneId >= offset)
+                prefix += n;
+        }
+
+        prefixDegrees[warpId * 32 + laneId] = prefix - deg;
+
+        // Step 3: get total edges in this warp
+        int totalEdges = __shfl_sync(0xffffffff, prefix, 31);
+
+        // Step 4: each thread in warp processes strided edges
+        int localCount = 0;
+        int localNeighbors[32];
+
+        for (int i = laneId; i < totalEdges; i += 32)
+        {
+            int srcIdx = 0;
+            while (srcIdx < 32 && i >= prefixDegrees[warpId * 32 + srcIdx] + vDegrees[warpId * 32 + srcIdx])
+                ++srcIdx;
+
+            if (srcIdx >= 32 || vList[warpId * 32 + srcIdx] == -1)
+                continue;
+
+            int v = vList[warpId * 32 + srcIdx];
+            int edgeOffset = vStartOffsets[warpId * 32 + srcIdx] + (i - prefixDegrees[warpId * 32 + srcIdx]);
+            int u = adjacencyList[edgeOffset];
+
+            if (atomicCAS(&parent[u], INT_MAX, v) == INT_MAX)
+            {
+                distance[u] = level + 1;
+                int pos = atomicAdd(nextQueueSize, 1);
+                nextQueue[pos] = u;
+
+                // Debug: print once if necessary
+            }
+        }
+
+        threadCounts[threadIdx.x] = localCount;
+        __syncthreads();
+
+        // Optional: threadOffsets and warp-sum logic if needed for other output (not required in current kernel)
+
+        // Note: You may safely remove localCount/localNeighbors if not used.
+    }
+
+    __global__ void scanBfsFusedKernel_CM(
+        const int *inputQueue, int inputQueueSize,
+        const int *adjacencyList, const int *edgesOffset, const int *edgesSize,
+        int *nextQueue, int *nextQueueSize,
+        int *parent, int *distance,
+        int level)
+    {
+
+        const int tid = threadIdx.x;
+        const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+
+        const int BLOCK_SIZE = 256;
+
+        __shared__ int vList[256]; // 每个 block 最多处理 256 个顶点
+        __shared__ int vOffset[256];
+        __shared__ int vDegree[256];
+        __shared__ int prefixSum[256];
+        __shared__ int totalEdges;
+
+        int v = -1, deg = 0, offset = 0;
+
+        // 每个线程加载一个顶点（注意越界）
+        int queueIdx = blockIdx.x * blockDim.x + tid;
+        if (queueIdx < inputQueueSize)
+        {
+            v = inputQueue[queueIdx];
+            offset = edgesOffset[v];
+            deg = edgesSize[v];
+        }
+
+        vList[tid] = v;
+        vOffset[tid] = offset;
+        vDegree[tid] = deg;
+        __syncthreads();
+
+        __shared__ typename cub::BlockScan<int, BLOCK_SIZE>::TempStorage temp_storage;
+
+        int degree = vDegree[tid];
+        int prefix = 0;
+        cub::BlockScan<int, BLOCK_SIZE>(temp_storage).ExclusiveSum(degree, prefix);
+
+        // 保存 prefixSum
+        prefixSum[tid] = prefix;
+
+        // tid==BLOCK_SIZE-1 时得到 totalEdges
+        if (tid == BLOCK_SIZE - 1)
+            totalEdges = prefix + degree;
+
+        __syncthreads();
+
+        // 每个线程负责处理部分边
+
+        for (int i = tid; i < totalEdges; i += BLOCK_SIZE)
+        {
+            // upper_bound to find source vertex index
+
+            int srcIdx = 0;
+            while (srcIdx + 1 < inputQueueSize && i >= prefixSum[srcIdx + 1])
+                ++srcIdx;
+            if (srcIdx >= inputQueueSize || vList[srcIdx] == -1)
+                continue;
+
+            int v = vList[srcIdx];
+            int localEdgeIdx = i - prefixSum[srcIdx];
+            int edgeOffset = vOffset[srcIdx] + localEdgeIdx;
+            int u = adjacencyList[edgeOffset];
+
+            if (atomicCAS(&parent[u], INT_MAX, v) == INT_MAX)
+            {
+                distance[u] = level + 1;
+                int pos = atomicAdd(nextQueueSize, 1);
+                nextQueue[pos] = u;
             }
         }
     }

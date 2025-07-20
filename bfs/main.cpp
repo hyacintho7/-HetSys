@@ -59,6 +59,8 @@ CUfunction cuScanBfsFusedKernel;
 CUfunction cuScanDegrees;
 CUfunction cuAssignVerticesNextQueue;
 CUfunction cuGunrockStyleBfsKernel;
+CUfunction cuScanBfsFusedKernel_WM;
+CUfunction cuScanBfsFusedKernel_CM;
 
 CUdeviceptr d_adjacencyList;
 CUdeviceptr d_edgesOffset;
@@ -87,6 +89,8 @@ void initCuda(Graph &G)
     checkError(cuModuleGetFunction(&cuScanDegrees, cuModule, "scanDegrees"), "cannot get kernel handle");
     checkError(cuModuleGetFunction(&cuAssignVerticesNextQueue, cuModule, "assignVerticesNextQueue"),
                "cannot get kernel handle");
+    checkError(cuModuleGetFunction(&cuScanBfsFusedKernel_WM, cuModule, "scanBfsFusedKernel_WM"), "cannot get scanBfsFusedKernel_WM handle");
+    checkError(cuModuleGetFunction(&cuScanBfsFusedKernel_CM, cuModule, "scanBfsFusedKernel_CM"), "cannot get scanBfsFusedKernel_CM handle");
 
     checkError(cuModuleGetFunction(&cuGunrockStyleBfsKernel, cuModule, "cuGunrockStyleBfsKernel"), "cannot get kernel handle");
 
@@ -471,11 +475,120 @@ void runCudaScanfusedBfs(int startVertex, Graph &G, std::vector<int> &distance,
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    // ⬇️ 关键步骤：把 device 上的结果拷回 host
+    //  关键步骤：把 device 上的结果拷回 host
     cudaMemcpy(distance.data(), (void *)d_distance, sizeof(int) * G.numVertices, cudaMemcpyDeviceToHost);
     cudaMemcpy(parent.data(), (void *)d_parent, sizeof(int) * G.numVertices, cudaMemcpyDeviceToHost);
 
     // 输出调试信息
+}
+
+void launchScanBfsFusedKernel_WM(
+    int queueSize, int level,
+    CUdeviceptr d_currentQueue,
+    CUdeviceptr d_adjacencyList,
+    CUdeviceptr d_edgesOffset,
+    CUdeviceptr d_edgesSize,
+    CUdeviceptr d_distance,
+    CUdeviceptr d_parent,
+    CUdeviceptr d_nextQueue,
+    CUdeviceptr d_nextQueueSize)
+{
+    int blockSize = 256;
+    int warpsPerBlock = blockSize / 32;
+    int numWarps = (queueSize + 31) / 32;
+    int gridSize = (numWarps + warpsPerBlock - 1) / warpsPerBlock;
+    int warpSize = 32;
+    int maxWarpsPerBlock = blockSize / warpSize;
+
+    size_t sharedMemBytes = sizeof(int) * (4 * maxWarpsPerBlock * warpSize + // vList, vStartOffsets, vDegrees, prefixDegrees
+                                           2 * blockSize +                   // threadCounts, threadOffsets
+                                           warpSize +                        // sharedOffset
+                                           1                                 // sharedGlobalOffset
+                                          );
+
+    void *args[] = {
+        &d_currentQueue,
+        &queueSize,
+        &d_adjacencyList,
+        &d_edgesOffset,
+        &d_edgesSize,
+        &d_distance,
+        &d_parent,
+        &d_nextQueue,
+        &d_nextQueueSize,
+        &level};
+
+    printLaunchConfig("scanBfsFusedKernel_WM", gridSize, blockSize);
+    checkError(cuLaunchKernel(cuScanBfsFusedKernel_WM,
+                              gridSize, 1, 1,
+                              blockSize, 1, 1,
+                              sharedMemBytes,
+                              0,
+                              args,
+                              0),
+               "cannot run kernel scanBfsFusedKernel_WM");
+}
+
+void runCudaScanfusedBfs_WM(int startVertex, Graph &G, std::vector<int> &distance,
+                            std::vector<int> &parent, float &kernelTimeUs)
+{
+    initializeCudaBfs(startVertex, distance, parent, G);
+
+    printf("Starting scanfused WM-style parallel BFS.\n");
+
+    int queueSize = 1;
+    int nextQueueSize = 0;
+    int level = 0;
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+
+    while (queueSize > 0)
+    {
+        int zero = 0;
+        checkError(cuMemcpyHtoD(d_nextQueueSizeDevice, &zero, sizeof(int)),
+                   "reset d_nextQueueSizeDevice");
+        // printf("Level %d: queueSize = %d\n", level, queueSize);
+        launchScanBfsFusedKernel_WM(queueSize, level,
+                                    d_currentQueue,
+                                    d_adjacencyList,
+                                    d_edgesOffset,
+                                    d_edgesSize,
+                                    d_distance,
+                                    d_parent,
+                                    d_nextQueue,
+                                    d_nextQueueSizeDevice);
+
+        cudaDeviceSynchronize();
+
+        checkError(cuMemcpyDtoH(&nextQueueSize, d_nextQueueSizeDevice, sizeof(int)),
+                   "read d_nextQueueSizeDevice");
+
+        std::swap(d_currentQueue, d_nextQueue);
+        queueSize = nextQueueSize;
+        level++;
+    }
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&kernelTimeUs, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaMemcpy(distance.data(), (void *)d_distance,
+               sizeof(int) * G.numVertices, cudaMemcpyDeviceToHost);
+    cudaMemcpy(parent.data(), (void *)d_parent,
+               sizeof(int) * G.numVertices, cudaMemcpyDeviceToHost);
+
+    // std::cout << "distance[0-100]: " << std::endl;
+
+    // for (int i = 0; i < 100; i++)
+    // {
+    //     std::cout << distance[i] << " ";
+    // }
 }
 
 // void runGunrockBFS(int startVertex, Graph &G, std::vector<int> &distance)
@@ -489,6 +602,98 @@ void runCudaScanfusedBfs(int startVertex, Graph &G, std::vector<int> &distance,
 //     gunrock::app::bfs::Enactor bfs;
 //     bfs.Enact(csr, startVertex, distance.data());
 // }
+
+void launchScanBfsFusedKernel_CM(
+    int queueSize, int level,
+    CUdeviceptr d_currentQueue,
+    CUdeviceptr d_adjacencyList,
+    CUdeviceptr d_edgesOffset,
+    CUdeviceptr d_edgesSize,
+    CUdeviceptr d_distance,
+    CUdeviceptr d_parent,
+    CUdeviceptr d_nextQueue,
+    CUdeviceptr d_nextQueueSize)
+{
+    int blockSize = 256;
+    int gridSize = (queueSize + blockSize - 1) / blockSize;
+
+    // 为每个 block 准备 3 倍 blockSize 的共享内存：vList, startOffsets, degrees
+    size_t sharedMemBytes = 3 * blockSize * sizeof(int);
+
+    void *args[] = {
+        &d_currentQueue,  // inputQueue
+        &queueSize,       // inputQueueSize
+        &d_adjacencyList, // adjacencyList
+        &d_edgesOffset,   // edgesOffset
+        &d_edgesSize,     // edgesSize
+        &d_nextQueue,     // nextQueue
+        &d_nextQueueSize, // nextQueueSize
+        &d_parent,        // parent
+        &d_distance,      // distance
+        &level            // level
+    };
+
+    printLaunchConfig("scanBfsFusedKernel_CM", gridSize, blockSize);
+    checkError(cuLaunchKernel(cuScanBfsFusedKernel_CM,
+                              gridSize, 1, 1,
+                              blockSize, 1, 1,
+                              sharedMemBytes,
+                              0,
+                              args,
+                              0),
+               "cannot run kernel scanBfsFusedKernel_CM");
+}
+
+void runCudaScanfusedBfs_CM(int startVertex, Graph &G, std::vector<int> &distance,
+                            std::vector<int> &parent, float &kernelTimeUs)
+{
+    initializeCudaBfs(startVertex, distance, parent, G);
+
+    printf("Starting scanfused CM-style parallel BFS.\n");
+    int queueSize = 1;
+    int nextQueueSize = 0;
+    int level = 0;
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start, 0);
+
+    while (queueSize)
+    {
+        int zero = 0;
+        checkError(cuMemcpyHtoD(d_nextQueueSizeDevice, &zero, sizeof(int)),
+                   "reset d_nextQueueSizeDevice");
+
+        launchScanBfsFusedKernel_CM(queueSize, level,
+                                    d_currentQueue,
+                                    d_adjacencyList,
+                                    d_edgesOffset,
+                                    d_edgesSize,
+                                    d_distance,
+                                    d_parent,
+                                    d_nextQueue,
+                                    d_nextQueueSizeDevice);
+
+        cudaDeviceSynchronize();
+
+        cuMemcpyDtoH(&nextQueueSize, d_nextQueueSizeDevice, sizeof(int));
+
+        std::swap(d_currentQueue, d_nextQueue);
+        queueSize = nextQueueSize;
+        level++;
+    }
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&kernelTimeUs, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaMemcpy(distance.data(), (void *)d_distance, sizeof(int) * G.numVertices, cudaMemcpyDeviceToHost);
+    cudaMemcpy(parent.data(), (void *)d_parent, sizeof(int) * G.numVertices, cudaMemcpyDeviceToHost);
+}
 
 void runCudaGunrockBfs(int startVertex, Graph &G, std::vector<int> &distance,
                        std::vector<int> &parent, float &kernelTimeUs)
@@ -627,17 +832,16 @@ int main(int argc, char **argv)
 
     // runVC_CM_BFS(G, startVertex);
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    kernel_time = 0.0f;
-    start_total = std::chrono::high_resolution_clock::now();
-    runCudaQueueBfs(startVertex, G, distance, parent, kernel_time);
-
-    end_total = std::chrono::high_resolution_clock::now();
-    total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    std::cout << "QueueBFS Kernel execution time: " << kernel_time << " ms\n";
-    std::cout << "QueueBFS End-to-end time: " << total_time_ms << " ms\n\n";
-    csvFile << "QueueBFS," << kernel_time << "," << total_time_ms << "\n";
-    checkOutput(distance, expectedDistance, G);
+    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // kernel_time = 0.0f;
+    // start_total = std::chrono::high_resolution_clock::now();
+    // runCudaQueueBfs(startVertex, G, distance, parent, kernel_time);
+    // end_total = std::chrono::high_resolution_clock::now();
+    // total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    // std::cout << "QueueBFS Kernel execution time: " << kernel_time << " ms\n";
+    // std::cout << "QueueBFS End-to-end time: " << total_time_ms << " ms\n\n";
+    // csvFile << "QueueBFS," << kernel_time << "," << total_time_ms << "\n";
+    // checkOutput(distance, expectedDistance, G);
 
     // std::this_thread::sleep_for(std::chrono::milliseconds(500));
     // kernel_time = 0.0f;
@@ -650,15 +854,43 @@ int main(int argc, char **argv)
     // csvFile << "ScanBFS," << kernel_time << "," << total_time_ms << "\n";
     // checkOutput(distance, expectedDistance, G);
 
+    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // kernel_time = 0.0f;
+    // start_total = std::chrono::high_resolution_clock::now();
+    // runCudaScanfusedBfs(startVertex, G, distance, parent, kernel_time);
+    // end_total = std::chrono::high_resolution_clock::now();
+    // total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    // std::cout << "ScanBFSfused Kernel execution time: " << kernel_time << " ms\n";
+    // std::cout << "ScanBFSfused End-to-end time: " << total_time_ms << " ms\n\n";
+    // csvFile << "ScanBFSfused," << kernel_time << "," << total_time_ms << "\n";
+    // checkOutput(distance, expectedDistance, G);
+
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     kernel_time = 0.0f;
     start_total = std::chrono::high_resolution_clock::now();
-    runCudaScanfusedBfs(startVertex, G, distance, parent, kernel_time);
+    runCudaScanfusedBfs_WM(startVertex, G, distance, parent, kernel_time);
     end_total = std::chrono::high_resolution_clock::now();
     total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    std::cout << "ScanBFSfused Kernel execution time: " << kernel_time << " ms\n";
-    std::cout << "ScanBFSfused End-to-end time: " << total_time_ms << " ms\n\n";
-    csvFile << "ScanBFS," << kernel_time << "," << total_time_ms << "\n";
+    std::cout << "ScanBFSfused_WM Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "ScanBFSfused_WM End-to-end time: " << total_time_ms << " ms\n\n";
+    csvFile << "ScanBFSfused_WM," << kernel_time << "," << total_time_ms << "\n";
+    checkOutput(distance, expectedDistance, G);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
+    start_total = std::chrono::high_resolution_clock::now();
+    runCudaScanfusedBfs_CM(startVertex, G, distance, parent, kernel_time);
+    end_total = std::chrono::high_resolution_clock::now();
+    total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    std::cout << "ScanBFSfused_CM Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "ScanBFSfused_CM End-to-end time: " << total_time_ms << " ms\n\n";
+    csvFile << "ScanBFSfused_CM," << kernel_time << "," << total_time_ms << "\n";
+    // std::cout << "expectedDistance[0-100]: " << std::endl;
+    //  for (int i = 0; i < 100; i++)
+    //  {
+    //      std::cout << expectedDistance[i] << " ";
+    //  }
+    //  printf("\n");
     checkOutput(distance, expectedDistance, G);
 
     // std::this_thread::sleep_for(std::chrono::milliseconds(500));
