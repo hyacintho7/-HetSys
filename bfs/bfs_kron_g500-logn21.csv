@@ -1,0 +1,7 @@
+Algorithm,KernelTime(ms),EndToEndTime(ms)
+SimpleBFS,15356.3,15369.9
+QueueBFS,18812.8,18824.6
+ScanBFS,34572.1,34582.8
+ScanBFSfused,20944.7,20955.9
+ScanBFSfused_WM,2231.31,2243.58
+ScanBFSfused_CM,369.569,377.699

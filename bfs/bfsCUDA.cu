@@ -434,12 +434,12 @@ extern "C"
         const int tid = threadIdx.x;
         const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
 
-        const int BLOCK_SIZE = 256;
+        const int BLOCK_SIZE = 1024;
 
-        __shared__ int vList[256]; // 每个 block 最多处理 256 个顶点
-        __shared__ int vOffset[256];
-        __shared__ int vDegree[256];
-        __shared__ int prefixSum[256];
+        __shared__ int vList[1024]; // 每个 block 最多处理 1024 个顶点
+        __shared__ int vOffset[1024];
+        __shared__ int vDegree[1024];
+        __shared__ int prefixSum[1024];
         __shared__ int totalEdges;
 
         int v = -1, deg = 0, offset = 0;

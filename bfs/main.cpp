@@ -101,7 +101,7 @@ void initCuda(Graph &G)
     checkError(cuMemAlloc(&d_distance, G.numVertices * sizeof(int)), "cannot allocate d_distance");
     checkError(cuMemAlloc(&d_parent, G.numVertices * sizeof(int)), "cannot allocate d_parent");
     checkError(cuMemAlloc(&d_currentQueue, G.numVertices * sizeof(int)), "cannot allocate d_currentQueue");
-    checkError(cuMemAlloc(&d_nextQueue, 4 * G.numVertices * sizeof(int)), "cannot allocate d_nextQueue");
+    checkError(cuMemAlloc(&d_nextQueue, G.numVertices * sizeof(int)), "cannot allocate d_nextQueue");
     checkError(cuMemAlloc(&d_degrees, G.numVertices * sizeof(int)), "cannot allocate d_degrees");
     checkError(cuMemAllocHost((void **)&incrDegrees, sizeof(int) * G.numVertices), "cannot allocate memory");
     checkError(cuMemAlloc(&d_nextQueueSizeDevice, sizeof(int)), "cannot allocate d_nextQueueSizeDevice");
@@ -321,9 +321,9 @@ void scanDegrees(int queueSize)
     // already written previous block sum
     // launchScanDegrees((int *)d_degrees, (int *)incrDegrees, queueSize);
     incrDegrees[0] = 0;
-    for (int i = 1024; i < queueSize + 1024; i += 1024)
+    for (int i = NUM_THREADS; i < queueSize + NUM_THREADS; i += NUM_THREADS)
     {
-        incrDegrees[i / 1024] += incrDegrees[i / 1024 - 1];
+        incrDegrees[i / NUM_THREADS] += incrDegrees[i / NUM_THREADS - 1];
     }
 }
 
@@ -350,7 +350,7 @@ void launchScanBfsFusedKernel(
     CUdeviceptr d_nextQueue,
     CUdeviceptr d_nextQueueSize)
 {
-    int blockSize = 256;
+    int blockSize = NUM_THREADS;
     size_t sharedMemBytes = (2 * blockSize + 64) * sizeof(int); // 动态共享内存大小
     int gridSize = (queueSize + blockSize - 1) / blockSize;
 
@@ -493,7 +493,7 @@ void launchScanBfsFusedKernel_WM(
     CUdeviceptr d_nextQueue,
     CUdeviceptr d_nextQueueSize)
 {
-    int blockSize = 256;
+    int blockSize = NUM_THREADS;
     int warpsPerBlock = blockSize / 32;
     int numWarps = (queueSize + 31) / 32;
     int gridSize = (numWarps + warpsPerBlock - 1) / warpsPerBlock;
@@ -614,7 +614,7 @@ void launchScanBfsFusedKernel_CM(
     CUdeviceptr d_nextQueue,
     CUdeviceptr d_nextQueueSize)
 {
-    int blockSize = 256;
+    int blockSize = NUM_THREADS;
     int gridSize = (queueSize + blockSize - 1) / blockSize;
 
     // 为每个 block 准备 3 倍 blockSize 的共享内存：vList, startOffsets, degrees
@@ -832,38 +832,38 @@ int main(int argc, char **argv)
 
     // runVC_CM_BFS(G, startVertex);
 
-    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    // kernel_time = 0.0f;
-    // start_total = std::chrono::high_resolution_clock::now();
-    // runCudaQueueBfs(startVertex, G, distance, parent, kernel_time);
-    // end_total = std::chrono::high_resolution_clock::now();
-    // total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    // std::cout << "QueueBFS Kernel execution time: " << kernel_time << " ms\n";
-    // std::cout << "QueueBFS End-to-end time: " << total_time_ms << " ms\n\n";
-    // csvFile << "QueueBFS," << kernel_time << "," << total_time_ms << "\n";
-    // checkOutput(distance, expectedDistance, G);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
+    start_total = std::chrono::high_resolution_clock::now();
+    runCudaQueueBfs(startVertex, G, distance, parent, kernel_time);
+    end_total = std::chrono::high_resolution_clock::now();
+    total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    std::cout << "QueueBFS Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "QueueBFS End-to-end time: " << total_time_ms << " ms\n\n";
+    csvFile << "QueueBFS," << kernel_time << "," << total_time_ms << "\n";
+    checkOutput(distance, expectedDistance, G);
 
-    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    // kernel_time = 0.0f;
-    // start_total = std::chrono::high_resolution_clock::now();
-    // runCudaScanBfs(startVertex, G, distance, parent, kernel_time);
-    // end_total = std::chrono::high_resolution_clock::now();
-    // total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    // std::cout << "ScanBFS Kernel execution time: " << kernel_time << " ms\n";
-    // std::cout << "ScanBFS End-to-end time: " << total_time_ms << " ms\n\n";
-    // csvFile << "ScanBFS," << kernel_time << "," << total_time_ms << "\n";
-    // checkOutput(distance, expectedDistance, G);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
+    start_total = std::chrono::high_resolution_clock::now();
+    runCudaScanBfs(startVertex, G, distance, parent, kernel_time);
+    end_total = std::chrono::high_resolution_clock::now();
+    total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    std::cout << "ScanBFS Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "ScanBFS End-to-end time: " << total_time_ms << " ms\n\n";
+    csvFile << "ScanBFS," << kernel_time << "," << total_time_ms << "\n";
+    checkOutput(distance, expectedDistance, G);
 
-    // std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    // kernel_time = 0.0f;
-    // start_total = std::chrono::high_resolution_clock::now();
-    // runCudaScanfusedBfs(startVertex, G, distance, parent, kernel_time);
-    // end_total = std::chrono::high_resolution_clock::now();
-    // total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
-    // std::cout << "ScanBFSfused Kernel execution time: " << kernel_time << " ms\n";
-    // std::cout << "ScanBFSfused End-to-end time: " << total_time_ms << " ms\n\n";
-    // csvFile << "ScanBFSfused," << kernel_time << "," << total_time_ms << "\n";
-    // checkOutput(distance, expectedDistance, G);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    kernel_time = 0.0f;
+    start_total = std::chrono::high_resolution_clock::now();
+    runCudaScanfusedBfs(startVertex, G, distance, parent, kernel_time);
+    end_total = std::chrono::high_resolution_clock::now();
+    total_time_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+    std::cout << "ScanBFSfused Kernel execution time: " << kernel_time << " ms\n";
+    std::cout << "ScanBFSfused End-to-end time: " << total_time_ms << " ms\n\n";
+    csvFile << "ScanBFSfused," << kernel_time << "," << total_time_ms << "\n";
+    checkOutput(distance, expectedDistance, G);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
     kernel_time = 0.0f;
